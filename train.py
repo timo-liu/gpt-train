@@ -10,6 +10,7 @@ import argparse
 from dataclasses import dataclass
 import os
 import torch
+import numpy as np
 import wandb
 import importlib
 import sys
@@ -318,7 +319,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument("language", type = str)
 parser.add_argument("paradigm", type = str)
 parser.add_argument("data_path", type = str)
-parser.add_argument("weights_path", type = str)
 
 parser.add_argument("--vocab_size", type = int, default = 50048)
 parser.add_argument("--eos_id", type = int, default = 288)
@@ -581,8 +581,8 @@ elif cc_major < 9:
 # endregion A100 magic
 
 # region dataset settings
-args.train_files = os.path.join(cli_args.data_dir, args.train_files_pattern)
-args.val_files = os.path.join(args.local_dir, args.val_files_pattern)
+args.train_files = os.path.join(cli_args.data_path, args.train_files_pattern)
+args.val_files = os.path.join(cli_args.data_path, args.val_files_pattern)
 # endregion dataset settings
 
 # region customops
@@ -1588,6 +1588,22 @@ class GPT(nn.Module):
 # endregion model
 
 # region ddl
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
 def _load_data_shard(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
@@ -1714,6 +1730,10 @@ def next_batch(self, num_tokens_local: int, max_seq_len: int):
 class DataPreloader:
     # Helper for asynchronously loading next shard and indexing bos tokens
     def __init__(self, file_iter, world_size: int = 1):
+        """
+        file_iter: an iterator that yields filenames (strings)
+        world_size: number of processes / ranks for BOSFinder
+        """
         self.file_iter = file_iter
         self.world_size = world_size
         self.thread = None
@@ -1721,16 +1741,49 @@ class DataPreloader:
         self.ready = threading.Event()
 
     def _load(self):
-        tokens = _load_data_shard(next(self.file_iter))
+        """
+        Thread target: peek header (validate) then load tokens and build BOSFinder.
+        """
+        try:
+            fname = next(self.file_iter)
+        except StopIteration:
+            # no more files to load
+            self.data = None
+            self.ready.set()
+            return
+
+        # preserve the header-peek/validation step used in the first preloader
+        # _peek_data_shard will perform the header checks (magic/version) and
+        # return the claimed ntok (and will exit/assert if header invalid).
+        ntok = _peek_data_shard(fname)
+
+        # Optionally you could use ntok for additional checks here.
+        # Now load actual tokens (this will skip the header internally).
+        tokens = _load_data_shard(fname)
+
+        # Sanity: loaded tokens length should match ntok
+        if len(tokens) != int(ntok):
+            # raise or handle as appropriate for your application
+            raise RuntimeError(f"token count mismatch for {fname}: header {ntok} vs loaded {len(tokens)}")
+
+        # Build BOSFinder and store the result
         self.data = (tokens, BOSFinder(tokens, self.world_size))
         self.ready.set()
 
     def start(self):
+        """
+        Kick off asynchronous load of the *next* file from file_iter.
+        """
+        # reset the ready event and start the loader thread
         self.ready.clear()
-        self.thread = threading.Thread(target=self._load)
+        self.thread = threading.Thread(target=self._load, daemon=True)
         self.thread.start()
 
     def get(self):
+        """
+        Wait for the async load to finish and return the (tokens, BOSFinder) tuple,
+        or None if there were no files to load.
+        """
         if self.thread:
             self.ready.wait()
             self.thread.join()
@@ -1788,10 +1841,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             cum_lengths = torch.nonzero(_inputs == args.bos_token_id)[:, 0]
             pos += num_tokens
 
-
+        num_docs = min(len(cum_lengths), max_num_docs - 1)
         _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
         _cum_lengths[0] = 0
-        _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
+        _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths[:num_docs]
 
         new_params = yield (
             _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
@@ -1982,7 +2035,7 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
 ########################################
 #            Warmup kernels            #
