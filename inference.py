@@ -1,11 +1,4 @@
-"""
-THIS CODE BELONGS ALMOST ENTIRELY TO CHRIS MCCORMICK
-https://colab.research.google.com/drive/1kv6G54avvUSTHi8zYXd_Lz1Gtu4VstDB?authuser=1
-
-CODE FOUND ON:
-https://github.com/KellerJordan/modded-nanogpt/discussions/156
-"""
-
+# region imports
 import argparse
 from dataclasses import dataclass
 import os
@@ -34,6 +27,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor, nn
+
+# endregion imports
 
 dynamo.config.recompile_limit = 64
 
@@ -318,7 +313,7 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
 parser = argparse.ArgumentParser()
 parser.add_argument("language", type = str)
 parser.add_argument("paradigm", type = str)
-parser.add_argument("data_path", type = str)
+parser.add_argument("weights", type = str)
 
 parser.add_argument("--vocab_size", type = int, default = 50048)
 parser.add_argument("--eos_id", type = int, default = 288)
@@ -329,6 +324,7 @@ parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 cli_args = parser.parse_args()
 
 # endregion parser
+
 
 # region definitions
 
@@ -362,7 +358,7 @@ class Configuration:
     num_chunks: int         = 9 # 900x10^6 tokens.
     train_batch_size: int   = 2048 * 16 * 8     # 256K
     train_max_seq_len: int  = 128 * 16          # 2K
-    val_batch_size: int     = 128 * 128 # 2M
+    val_batch_size: int     = 4 * 64 * 1024 * 8 # 2M
 
     # Dataset settings (GPT-2 FineWeb)
     repo_id: str             = "kjj0/fineweb10B-gpt2"
@@ -373,7 +369,7 @@ class Configuration:
     val_files: str           = None
 
     val_ratio: float   = 1.0
-    val_tokens: int    = 128 * 128
+    val_tokens: int    = 10485760
 
     # ==== Optimization ====
     num_scheduled_iterations: int = 2245  # number of steps to complete lr and ws schedule
@@ -407,7 +403,7 @@ class Configuration:
 
     log_file: str          = ""  # Will be set after log file is created
 
-    val_loss_every: int    = 1  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int    = 100  # every how many steps to evaluate val loss? 0 for only at the end
 
     save_checkpoint: bool = True
     early_quit: int       = None  # Quit at a specific step, or `None`.
@@ -459,88 +455,6 @@ args.max_seq_len = max(args.train_batch_size, args.val_batch_size) // (args.grad
 
 # endregion args
 
-# region prep logs
-if master_process:
-    run_id = args.run_id
-    os.makedirs("logs/new", exist_ok=True)
-    args.log_file = f"logs/{run_id}.txt"
-    print(args.log_file)
-# endregion prep logs
-
-# region precalc
-
-total_steps = args.num_iterations  # num_scheduled_iterations + num_extension_iterations
-lr_schedule = []
-
-for step in range(total_steps + 1):
-    if step < args.num_scheduled_iterations:
-        lr_schedule.append(get_lr(step))
-    else:
-        # Extension steps use the final lr from scheduled iterations
-        lr_schedule.append(get_lr(args.num_scheduled_iterations - 1))
-
-# Pre-calculate optimizer-specific learning rate schedules
-adam_lr_schedule = [lr * args.adam_lr for lr in lr_schedule]
-muon_lr_schedule = [lr * args.muon_lr for lr in lr_schedule]
-
-ws_short_schedule = []
-ws_long_schedule = []
-
-if args.ws_schedule_steps is not None:
-    # Manual step transition points
-    assert len(args.ws_schedule_steps) == len(args.ws_schedule), \
-        f"ws_schedule_steps length ({len(args.ws_schedule_steps)}) must match ws_schedule length ({len(args.ws_schedule)})"
-
-    for step in range(total_steps + 1):
-        if step >= args.num_scheduled_iterations:
-            # Extension steps use ws_final
-            ws_short_schedule.append(args.ws_final // 2)
-            ws_long_schedule.append(args.ws_final)
-        else:
-            # Find the appropriate ws_idx based on step transition points
-            ws_idx = 0
-            for i in range(len(args.ws_schedule_steps) - 1, -1, -1):
-                if step >= args.ws_schedule_steps[i]:
-                    ws_idx = i
-                    break
-            ws_idx = min(ws_idx, len(args.ws_schedule) - 1)
-
-            ws_long = args.ws_schedule[ws_idx]
-            ws_short = ws_long // 2
-            ws_short_schedule.append(ws_short)
-            ws_long_schedule.append(ws_long)
-else:
-    # Default: use get_ws() for linear division
-    for step in range(total_steps + 1):
-        ws_short, ws_long = get_ws(step)
-        ws_short_schedule.append(ws_short)
-        ws_long_schedule.append(ws_long)
-
-momentum_schedule = []
-
-for step in range(total_steps + 1):
-    momentum_schedule.append(get_muon_momentum(step, args.momentum_warmup_steps, args.momentum_cd_steps))
-
-# endregion precalc
-
-# region wandbsetup
-
-val_loss_history = [float('nan')] * (total_steps + 1)  # NaN for steps without validation
-step_time_history = [0.0] * (total_steps + 1)  # Time taken for each training step (ms)
-cumulative_train_time_history = [0.0] * (total_steps + 1)  # Cumulative training time up to each step (ms)
-if master_process:
-    run_id = args.run_id
-    os.makedirs("logs/new", exist_ok=True)
-    args.log_file = f"logs/{run_id}.txt"
-    print(args.log_file)
-
-def wb_log0(data, step):
-    if master_process:
-        wandb.log(data, step=step)
-
-wandb.login()
-
-# endregion wandbsetup
 
 # region A100 magic
 cc_major, cc_minor = torch.cuda.get_device_capability()
@@ -579,11 +493,6 @@ elif cc_major < 9:
     os.environ["DISABLE_FP8"] = "True"
 
 # endregion A100 magic
-
-# region dataset settings
-args.train_files = os.path.join(cli_args.data_path, args.train_files_pattern)
-args.val_files = os.path.join(cli_args.data_path, args.val_files_pattern)
-# endregion dataset settings
 
 # region customops
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
@@ -1587,694 +1496,112 @@ class GPT(nn.Module):
 
 # endregion model
 
-# region ddl
-
-def _peek_data_shard(filename):
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240520:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-        exit(1)
-    assert header[1] == 1, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
-
-def _load_data_shard(file: Path):
-    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
-    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-    assert header[1] == 1, "unsupported version"
-    num_tokens = int(header[2]) # number of tokens (claimed)
-    with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
-        f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-    return tokens
-
-class BOSFinder:
-    # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
-    def __init__(self, tokens: Tensor, world_size: int = 1, quickload: bool = False):
-        # Precompute BOS positions once per shard
-        self.tokens=tokens
-        self.size = tokens.numel()
-        self.quickload = quickload
-        if quickload:
-            # only scan first 4 million tokens, then kickoff async thread to scan rest
-            self.bos_idx = (tokens[:4_000_000] == args.bos_token_id).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
-            self.thread = None
-            self.ready = threading.Event()
-            self.start()
-        else:
-            self.bos_idx = (tokens == args.bos_token_id).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
-        self.i = 0
-        self.world_size = world_size
-        self.batch_iter = 0
-
-    def _load(self):
-        self.bos_idx_async = (self.tokens == args.bos_token_id).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
-        self.ready.set()
-
-    def start(self):
-        self.ready.clear()
-        self.thread = threading.Thread(target=self._load)
-        self.thread.start()
-
-    def get(self):
-        if self.thread:
-            self.ready.wait()
-            self.thread.join()
-        self.bos_idx = self.bos_idx_async
-
-    def next_batch(self, num_tokens_local: int, max_seq_len: int):
-        # if quickload was used, repoint to the full dataset after 5 batches
-        if self.quickload and self.batch_iter == 5:
-            self.get()
-
-        if max_seq_len <= 0 or num_tokens_local <= 0:
-            raise ValueError(f"Invalid arguments: {num_tokens_local=}, {max_seq_len=}")
-
-        n = len(self.bos_idx)
-        if n == 0:
-            raise StopIteration("No BOS tokens found in shard; advancing to next shard.")
-
-        starts = [[] for _ in range(self.world_size)]
-        ends = [[] for _ in range(self.world_size)]
-
-        idx = self.i
-        for r in range(self.world_size):
-            cur_len = 0
-            while cur_len <= num_tokens_local:
-                if idx >= n:
-                    last = self.bos_idx[n - 1] if n > 0 else -1
-                    raise StopIteration(
-                        f"Insufficient BOS after index {int(last)}; hit tail of shard. "
-                        f"(requested {num_tokens_local=}, {max_seq_len=})"
-                    )
-
-                cur = int(self.bos_idx[idx])
-                starts[r].append(cur)
-
-                next_boundary = int(self.bos_idx[idx + 1]) if (idx + 1) < n else int(self.size)
-                end = min(
-                    next_boundary,                         # stop at next doc start
-                    cur + int(max_seq_len),                # or max sequence length
-                    cur + int(num_tokens_local - cur_len + 1)  # or remaining budget (+1 for targets shift)
-                )
-                ends[r].append(end)
-
-                cur_len += (end - cur)
-                idx += 1
-
-            # Expect exactly +1 because inputs/targets are offset by one token
-            assert cur_len == num_tokens_local + 1, (
-                f"Batch assembly mismatch: got {cur_len}, expected {num_tokens_local + 1}"
-            )
-
-        self.i = idx
-        self.batch_iter += 1
-        return starts, ends
-
-def next_batch(self, num_tokens_local: int, max_seq_len: int):
-    # if quickload was used, repoint to the full dataset after 5 batches
-    if self.quickload and self.batch_iter==5:
-        self.get()
-    n = len(self.bos_idx)
-    starts = [[] for _ in range(self.world_size)]
-    ends = [[] for _ in range(self.world_size)]
-
-    idx = self.i
-    for r in range(self.world_size):
-        cur_len = 0
-        while cur_len <= num_tokens_local:
-            if idx >= n:
-                raise StopIteration(f"Insufficient BOS ahead of position {cur}; hit tail of shard.")
-            cur = self.bos_idx[idx]
-            starts[r].append(cur)
-            end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
-                        cur + max_seq_len,
-                        cur + num_tokens_local - cur_len + 1)
-            ends[r].append(end)
-            cur_len += end - cur
-            idx += 1
-
-        assert cur_len == num_tokens_local + 1
-    self.i = idx
-    self.batch_iter+=1
-    return starts, ends
-
-class DataPreloader:
-    def __init__(self, file_iter, world_size: int = 1):
-        """
-        file_iter: an iterator that yields filenames (strings)
-        world_size: number of processes / ranks for BOSFinder
-        """
-        self.file_iter = file_iter
-        self.world_size = world_size
-        self.thread = None
-        self.data = None
-        self.ready = threading.Event()
-        self.first_file = None  # cache the first file name
-
-    def _load(self):
-        """
-        Thread target: peek header (validate) then load tokens and build BOSFinder.
-        """
-        try:
-            fname = next(self.file_iter)
-            if self.first_file is None:
-                self.first_file = fname  # remember the first file
-        except StopIteration:
-            # loop back to the first file if out of files
-            if self.first_file is None:
-                self.data = None
-                self.ready.set()
-                return
-            fname = self.first_file
-
-        ntok = _peek_data_shard(fname)
-        tokens = _load_data_shard(fname)
-
-        if len(tokens) != int(ntok):
-            raise RuntimeError(f"token count mismatch for {fname}: header {ntok} vs loaded {len(tokens)}")
-
-        self.data = (tokens, BOSFinder(tokens, self.world_size))
-        self.ready.set()
-
-    def start(self):
-        """
-        Kick off asynchronous load of the *next* file from file_iter.
-        """
-        self.ready.clear()
-        self.thread = threading.Thread(target=self._load, daemon=True)
-        self.thread.start()
-
-    def get(self):
-        """
-        Wait for the async load to finish and return the (tokens, BOSFinder) tuple.
-        If out of files, reloads the first file.
-        """
-        if self.thread:
-            self.ready.wait()
-            self.thread.join()
-        return self.data
-
-
-def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
-    # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"
-    num_tokens = num_tokens // grad_accum_steps
-
-    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
-    if not files:
-        raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
-
-    file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
-    tokens = _load_data_shard(next(file_iter))
-    if align_to_bos:
-        finder = BOSFinder(tokens, world_size=world_size, quickload=True)
-        preloader = DataPreloader(file_iter, world_size)
-        preloader.start()
-    else:
-        pos = 0  # for unaligned case
-
-    while True:
-        num_tokens_local = num_tokens // world_size
-        max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)  # median doc length is ~400
-
-        if align_to_bos:
-            try:
-                seq_starts, seq_ends = finder.next_batch(num_tokens_local, max_seq_len)
-                start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
-            except StopIteration:
-                # This shard is exhausted, load the next one in the next loop iteration.
-                tokens, finder = preloader.get()
-                preloader.start()
-                continue
-
-            buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
-            _inputs = buf[:-1]
-            _targets = buf[1:]
-            end_idxs[-1] -= 1  # last document was too long to account for _targets offset
-            cum_lengths = (end_idxs - start_idxs).cumsum(0)
-
-        else:
-            if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
-                tokens, pos = _load_data_shard(next(file_iter)), 0
-
-            pos_local = pos + rank * num_tokens_local
-            buf = tokens[pos_local: pos_local + num_tokens_local + 1]
-            _inputs = buf[:-1].view(num_tokens_local, )
-            _targets = buf[1:].view(num_tokens_local, )
-
-            cum_lengths = torch.nonzero(_inputs == args.bos_token_id)[:, 0]
-            pos += num_tokens
-
-        num_docs = min(len(cum_lengths), max_num_docs - 1)
-        _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
-        _cum_lengths[0] = 0
-        _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths[:num_docs]
-
-        new_params = yield (
-            _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
-            _targets.to(device="cuda", dtype=torch.int64, non_blocking=True),
-            _cum_lengths.to(device="cuda", dtype=torch.int32, non_blocking=True)
-        )
-
-        if new_params is not None:
-            # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
-            new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
-            assert new_num_tokens % (world_size * grad_accum_steps) == 0, "Num tokens must be divisible by world size"
-            num_tokens = new_num_tokens
-            max_seq_len = new_max_seq_len
-            grad_accum_steps = new_grad_accum_steps
-# endregion ddl
-
-# region training
-# -----------------------------------------------------------------------------
-# int main
-
-if not dist.is_initialized():
-    # set up DDP (distributed data parallel). torchrun sets this env variable
-    dist.init_process_group(backend="nccl", device_id=device)
-
-dist.barrier()
-
-model: nn.Module = GPT(
-    vocab_size  = args.vocab_size,
-    num_layers  = args.num_layers,
-    num_heads   = args.num_heads,
-    head_dim    = args.head_dim,
-    model_dim   = args.model_dim,
-    max_seq_len = args.max_seq_len
-).cuda()
-
-# Continue logging system information
-print0("="*100)
-# log information about the hardware/software environment this is running on
-print0(f"Running Python {sys.version}")
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0(f"Running Triton version {triton.__version__}")
-
-def nvidia_smi():
-    import subprocess  # avoid top level import
-    return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-
-print0(nvidia_smi())
-print0("="*100)
-
-from tabulate import tabulate
-
-print0("\n======== Configuration ========\n")
-
-# Retrieve the args as rows and print with tabulate.
-args_dict = vars(args)
-rows = [(k, v) for k, v in args_dict.items()]
-print0(tabulate(rows, headers=["Arg", "Value"], tablefmt="github"))
-
-# Print the architecture
-print0("\n======== Model Architecture ========\n")
-print0(model)
-
-# Print the list of parameters and their sizes
-print0("\n======== Parameter Summary ========\n")
-args.total_params = summarize_parameters(model)
-
-# Add the parameter count as a prefix to the run ID.
-#args.run_name = args.run_name.replace("<total_params - >", f"{format_size(args.total_params)} - ")
-
-if master_process:
-    print0("\n======== Weights & Biases ========\n")
-
-    # ==== wandb ====
-    wandb.init(
-        project=args.wandb_project,
-        name=args.wb_run_name,
-        config=args
-    )
-
-    # Save for retrieval down in the results section.
-    args.wb_run_id = wandb.run.id
-
-    wandb.define_metric("final/*", step_metric=None, summary="last")  # one-off scalars
-
-    if args.wandb_watch:
-        # log="all" → logs both gradients and parameters
-        #     "gradients" or "parameters" → limits scope
-        # log_freq=100 → upload histograms every 100 steps (can be expensive)
-        # log_graph=True → explicitly log model graph once (default: True for first watch call)
-        wandb.watch(model, log="all", log_freq=100)
-
-
-def save_checkpoint(step, reason=""):
-    """
-    Save a checkpoint at the current step.
-
-    Args:
-        step: Current training step
-        reason: Optional description (e.g., "early_quit", "final")
-    """
-    if master_process and args.save_checkpoint:
-        print0(f"Saving checkpoint at step {step}" + (f" ({reason})" if reason else ""))
-
-        log = dict(
-            step=step,
-            code="",
-            model=model.state_dict(),
-            optimizers=[opt.state_dict() for opt in optimizers],
-            # Schedules
-            adam_lr_schedule=adam_lr_schedule,
-            muon_lr_schedule=muon_lr_schedule,
-            momentum_schedule=momentum_schedule,
-            ws_short_schedule=ws_short_schedule,
-            ws_long_schedule=ws_long_schedule,
-            # Tracking arrays
-            val_loss_history=val_loss_history,
-            step_time_history=step_time_history,
-            cumulative_train_time_history=cumulative_train_time_history,
-            # Config info
-            config=vars(args),
-        )
-        os.makedirs(f"logs/{run_id}", exist_ok=True)
-        torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-
-        # Set model path for potential HellaSwag evaluation
-        args.model_path = f"logs/{run_id}/state_step{step:06d}.pt"
-
-        print0(f"Checkpoint saved: {args.model_path}")
+# region load model
+torch.set_float32_matmul_precision('high')
+model.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in torch.load(cli_args.weights, map_location="cpu")["model"].items()})
 
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
-for param in model.parameters():
-    dist.broadcast(param.detach(), 0)
 
-# collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if
-                        p.ndim >= 2 and "embed" not in n and "gate" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
-gate_params = [p for n, p in model.named_parameters() if "gate" in n]
+model.to(device)
+# endregion load model
 
-# init the optimizer(s)
-# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(
-    scalar_params + head_params + embed_params,
-    lr=args.adam_lr,
-    betas=(0.65, 0.95),
-    eps=1e-8,
-    weight_decay=0.0,
-)
-optimizer2 = NorMuon(
-    hidden_matrix_params + gate_params,
-    lr=args.muon_lr,
-    momentum=0.95,
-    beta2=0.95,
-    weight_decay=0.0,
-)
-optimizers = [optimizer1, optimizer2]
+# region infer
+model.eval()
 
-# Set initial_lr for the new step_optimizers function
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["initial_lr"] = group["lr"]
+# Similuate the yarn scaling to ensure that it matches how the model was trained.
+# To get the attn_scale and rotary params to match the final trained model:
+model.yarn.apply(3,7)
+model.yarn.apply(7,11)
+model.yarn.apply(11,13)
 
-# learning rate schedule: stable then decay
+def generate_padded(
+    prompt: str,
+    max_new_tokens: int = 50,
+    temperature: float = 0.7,
+    pad_to_multiple: int = 16
+):
+    """
+    Generates text autoregressively by re-padding and re-computing
+    the entire sequence for each new token.
+    """
 
-def step_optimizers(step: int, optimizers, model):
-    # update lr
-    for optimizer in optimizers:
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+    # 1. Tokenize the initial prompt and prepend BOS token
+    prompt_tokens = [args.bos_token_id] + enc_encode(prompt)
 
-    # set muon momentum based on step
-    momentum = get_muon_momentum(step)
-    for group in optimizers[1].param_groups:
-        group["momentum"] = momentum
+    print(prompt, end="", flush=True)
 
-    # on even steps, only step Muon params
-    # on odd steps, step all params
-    if step%2==0:
-        optimizers[1].step()
-        optimizers[1].zero_grad(set_to_none=True)
-    else:
-        for optimizer in optimizers:
-            optimizer.step()
-        model.zero_grad(set_to_none=True)
+    # We will run the generation inside inference_mode
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
 
-#model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+            # --- 2. Prepare Inputs (The "Hard Way") ---
 
-########################################
-#            Warmup kernels            #
-########################################
-print0("\n======== Kernel Warmup ========\n")
-warmup_t0 = time.time()
+            # Get the current unpadded length
+            T_unpadded = len(prompt_tokens)
 
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 30
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(
-    args.train_files,
-    args.train_batch_size,
-    args.train_max_seq_len,
-    grad_accum_steps=grad_accum_steps
-)
-ws_long = args.ws_schedule[0]
-for step in range(warmup_steps):
-    inputs, targets, cum_seqlens = next(train_loader)
-    new_ws_long = args.ws_schedule[step % len(args.ws_schedule)]  # each window size is a new graph, need to warm up each with YaRN params
-    if new_ws_long > ws_long:
-        model.yarn.apply(ws_long, new_ws_long)
-        ws_long = new_ws_long
-    elif new_ws_long<ws_long:
-        model.yarn.reset()
-        ws_long = new_ws_long
-    #model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
-    model(inputs, cum_seqlens, ws_long//2, ws_long, targets, inference=False).backward()
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-model.yarn.reset() # rotary buffer is not stored in state_dict
-model.load_state_dict(initial_state["model"])
-optimizer2.reset()  # Reset NorMuon momentum buffers (not stored in state dict)
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del train_loader, initial_state
+            # Calculate padding needed to reach the next multiple
+            pad_to = math.ceil(T_unpadded / pad_to_multiple) * pad_to_multiple
 
-warmup_time = time.time() - warmup_t0
-print0(f"Warmup time: {fmt_elapsed(warmup_time)}")
+            # The model's attention layer asserts T % 16 == 0.
+            assert pad_to % 16 == 0
 
-# Close the wandb run if the code crashes / is interrupted.
-import atexit
-if master_process:
-    atexit.register(wandb.finish)
+            pad_needed = pad_to - T_unpadded
 
-print0("\n======== Training ========\n")
+            # Create the padded tokens tensor
+            tokens_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
+            # Pad on the right with 0 (which is what F.pad uses by default)
+            tokens_tensor = F.pad(tokens_tensor, (0, pad_needed), value=0)
 
-# The benchmark stops the clock for the validation segments. To measure how much
-# these contribute, we'll measure the end-to-end training time.
-train_plus_val_t0 = time.time()
+            T_padded = len(tokens_tensor)
 
-########################################
-#        Training and validation       #
-########################################
+            # Create the 'seqlens' tensor for the varlen function
+            # We're passing a single sequence (B=1).
+            # The HellaSwag code passed [0, total_padded_length] for its
+            # single *concatenated* batch. We do the same here for our
+            # single *prompt* sequence.
+            seqlens = torch.tensor([0, T_padded], dtype=torch.int32, device=device)
 
-train_loader = distributed_data_generator(
-    args.train_files,
-    args.train_batch_size,
-    args.train_max_seq_len,
-    grad_accum_steps=grad_accum_steps
-)
-training_time_ms = 0
-validation_time_ms = 0
+            # Set window sizes (from HellaSwag eval)
+            ws_short = 6
+            ws_long = 20
 
-# start the clock
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-# begin training
-train_steps = args.num_iterations  # num_scheduled_iterations + num_extension_iterations
-ws_short = ws_short_schedule[0]
-ws_long = ws_long_schedule[0]
-step = 0
-while step <= train_steps:
-    last_step = (step == train_steps)
+            # --- 3. Run the Model ---
 
-    ws_short = ws_short_schedule[step]
-    new_ws_long = ws_long_schedule[step]
+            logits = model(tokens_tensor, seqlens, ws_short, ws_long, inference=True).squeeze(0)
 
-    if new_ws_long != ws_long:
-        model.yarn.apply(ws_long, new_ws_long)
-        ws_long=new_ws_long
+            # --- 4. Get the Next Token ---
 
-    # --------------- VALIDATION SECTION -----------------
-    # Run validation at regular intervals, at the end of main iterations, and at the final step
-    end_of_main_iterations = (step == args.num_iterations)
-    if last_step or end_of_main_iterations or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if last_step:
-            ws_long = args.ws_validate_post_yarn_ext  # Extended window size for final validation
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
+            # We need the logits for the *next* token.
+            # Logits at index `i` predict token `i+1`.
+            # So, we want the logits at the position of the last *real* token.
+            last_token_logits = logits[T_unpadded - 1, :]
 
-        # Start validation timing
-        val_t0 = time.perf_counter()
+            # --- 5. Sample a New Token ---
 
-        model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
+            if temperature == 0.0:
+                # Argmax (greedy)
+                next_token_id = torch.argmax(last_token_logits).item()
+            else:
+                # Apply temperature
+                probs = F.softmax(last_token_logits / temperature, dim=-1)
+                # Sample
+                next_token_id = torch.multinomial(probs, num_samples=1).item()
 
-        # <<<< Changed >>>>
-        # Set val_accum_steps at the top of the notebook to avoid OOM on a
-        # 40GB A100.
-        val_steps = val_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(
-            args.val_files,
-            args.val_batch_size,
-            -1,
-            grad_accum_steps=val_accum_steps, # <-- Changed
-            align_to_bos=False
-        )
+            # --- 6. Append and Loop ---
 
-        val_loss = 0
+            # Stop if we generate the EOT token
+            if next_token_id == token_eot:
+                print("\n[<EOT>]")
+                break
 
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens = next(val_loader)
-                #val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
-                val_loss += model(inputs, cum_seqlens, ws_short, ws_long, targets, inference=False)
+            # This is the "re-create the input" step for the next loop
+            prompt_tokens.append(next_token_id)
 
-        # Calculate validation loss
-        val_loss = (val_loss * args.val_ratio) / val_steps
+            # Print the newly generated token
+            print(enc.decode([next_token_id]), end="", flush=True)
 
-        del val_loader
-
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-
-        # Store validation loss in history
-        val_loss_history[step] = float(val_loss.item())
-
-        # Log to wandb
-        wb_log0({
-            "val/loss": val_loss.item(),
-        }, step=step)
-
-        model.train()
-
-        # Stop validation timing
-        torch.cuda.synchronize()
-        validation_time_ms += 1000 * (time.perf_counter() - val_t0)
-
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-    if last_step:
-        if master_process:
-
-            final_metrics = {
-                "final/val_loss": float(val_loss.item()),
-                "final/val_time_ms": int(validation_time_ms),
-                "final/train_time_ms": int(training_time_ms),
-                "final/train_time": fmt_elapsed(training_time_ms / 1000),
-                "final/steps_total": int(step),
-            }
-
-            # Log a single point (optional, helps if you ever filter by metrics, not just summary)
-            wandb.log(final_metrics)
-
-            # Ensure they're captured as run-level summary scalars for bar charts
-            wandb.run.summary.update(final_metrics)
-
-        # Save checkpoint at final step
-        save_checkpoint(step, reason="final")
-        # the last step only has the validation loop, so break to avoid training
-        break
-
-    # Check for early quit condition
-    if args.early_quit is not None and step == args.early_quit:
-        print0(f"Early quit triggered at step {step}")
-        # Save checkpoint before exiting
-        save_checkpoint(step, reason="early_quit")
-
-        print0(f"Training ended early at step {step}/{train_steps}")
-        break
-
-    # --------------- TRAINING SECTION -----------------
-    for _ in range(grad_accum_steps):
-        inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, cum_seqlens, ws_short, ws_long, targets, inference=False).backward()
-
-    # Use new step_optimizers function which handles lr, momentum, and stepping
-    step_optimizers(step, optimizers, model)
-
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
-
-    # Store timing information in history
-    cumulative_train_time_history[step] = approx_training_time_ms
-    step_time_history[step] = approx_training_time_ms / (step + 1)  # Average time per step
-
-    # Log to wandb
-    idx = min(step, len(adam_lr_schedule) - 1)
-    wb_log0({
-        "train/short_win":   ws_short_schedule[step] * args.block_size,
-        "train/long_win":    ws_long_schedule[step] * args.block_size,
-        "train/momentum":    momentum_schedule[idx],
-        "train/adam_lr":     adam_lr_schedule[idx],
-        "train/muon_lr":     muon_lr_schedule[idx],
-        "time/train_ms":    approx_training_time_ms,
-        "time/step_avg_ms": approx_training_time_ms / (step + 1),
-    }, step=step)
-
-
-    # Increment step for next iteration
-    step += 1
-
-print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-
-print0(f" Since notebook start: {fmt_elapsed(time.time() - full_notebook_t0)}")
-print0(f"Training + validation: {fmt_elapsed(time.time() - train_plus_val_t0)}")
-
-# Calculate durations for this config
-dur_kernel_warmup = warmup_time  # Already in seconds
-dur_train = training_time_ms / 1000.0  # Convert ms to seconds
-dur_val = validation_time_ms / 1000.0  # Convert ms to seconds
-
-if master_process:
-    # Log timing breakdowns to wandb (both raw and formatted)
-    timing_metrics = {
-        # Raw times (in seconds, except for ms which stay in ms)
-        "timing/kernel_warmup_sec": dur_kernel_warmup,
-        "timing/train_sec": dur_train,
-        "timing/val_sec": dur_val,
-        # Formatted strings
-        "timing/kernel_warmup": fmt_elapsed(dur_kernel_warmup),
-        "timing/train": fmt_elapsed(dur_train),
-        "timing/val": fmt_elapsed(dur_val),
-    }
-
-    # Log to wandb
-    wandb.log(timing_metrics)
-    wandb.run.summary.update(timing_metrics)
-
-    # Add the log file to the wandb run
-    wandb.save(args.log_file)
-
-    # End the run.
-    wandb.finish()
-
-if not args.run_hellaswag:
-    dist.destroy_process_group()
-
-# endregion training
+    print() # Final newline
+    return enc.decode(prompt_tokens)
+# endregion infer

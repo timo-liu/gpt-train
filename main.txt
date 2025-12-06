@@ -373,7 +373,7 @@ class Configuration:
     val_files: str           = None
 
     val_ratio: float   = 1.0
-    val_tokens: int    = 128 * 128
+    val_tokens: int    = 128*128
 
     # ==== Optimization ====
     num_scheduled_iterations: int = 2245  # number of steps to complete lr and ws schedule
@@ -407,7 +407,7 @@ class Configuration:
 
     log_file: str          = ""  # Will be set after log file is created
 
-    val_loss_every: int    = 1  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int    = 50  # every how many steps to evaluate val loss? 0 for only at the end
 
     save_checkpoint: bool = True
     early_quit: int       = None  # Quit at a specific step, or `None`.
@@ -1728,6 +1728,7 @@ def next_batch(self, num_tokens_local: int, max_seq_len: int):
     return starts, ends
 
 class DataPreloader:
+    # Helper for asynchronously loading next shard and indexing bos tokens
     def __init__(self, file_iter, world_size: int = 1):
         """
         file_iter: an iterator that yields filenames (strings)
@@ -1738,7 +1739,6 @@ class DataPreloader:
         self.thread = None
         self.data = None
         self.ready = threading.Event()
-        self.first_file = None  # cache the first file name
 
     def _load(self):
         """
@@ -1746,22 +1746,27 @@ class DataPreloader:
         """
         try:
             fname = next(self.file_iter)
-            if self.first_file is None:
-                self.first_file = fname  # remember the first file
         except StopIteration:
-            # loop back to the first file if out of files
-            if self.first_file is None:
-                self.data = None
-                self.ready.set()
-                return
-            fname = self.first_file
+            # no more files to load
+            self.data = None
+            self.ready.set()
+            return
 
+        # preserve the header-peek/validation step used in the first preloader
+        # _peek_data_shard will perform the header checks (magic/version) and
+        # return the claimed ntok (and will exit/assert if header invalid).
         ntok = _peek_data_shard(fname)
+
+        # Optionally you could use ntok for additional checks here.
+        # Now load actual tokens (this will skip the header internally).
         tokens = _load_data_shard(fname)
 
+        # Sanity: loaded tokens length should match ntok
         if len(tokens) != int(ntok):
+            # raise or handle as appropriate for your application
             raise RuntimeError(f"token count mismatch for {fname}: header {ntok} vs loaded {len(tokens)}")
 
+        # Build BOSFinder and store the result
         self.data = (tokens, BOSFinder(tokens, self.world_size))
         self.ready.set()
 
@@ -1769,20 +1774,20 @@ class DataPreloader:
         """
         Kick off asynchronous load of the *next* file from file_iter.
         """
+        # reset the ready event and start the loader thread
         self.ready.clear()
         self.thread = threading.Thread(target=self._load, daemon=True)
         self.thread.start()
 
     def get(self):
         """
-        Wait for the async load to finish and return the (tokens, BOSFinder) tuple.
-        If out of files, reloads the first file.
+        Wait for the async load to finish and return the (tokens, BOSFinder) tuple,
+        or None if there were no files to load.
         """
         if self.thread:
             self.ready.wait()
             self.thread.join()
         return self.data
-
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
